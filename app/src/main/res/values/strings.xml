@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">StringTune</string>
+    <string name="button_record">Record (5s)</string>
+    <string name="button_play">Play</string>
+    <string name="status_idle">Ready</string>
+    <string name="status_recording">Recording…</string>
+    <string name="status_playing">Playing…</string>
+    <string name="status_recorded">Recording complete</string>
+    <string name="permission_required">Microphone permission is required to record audio.</string>
+</resources>
