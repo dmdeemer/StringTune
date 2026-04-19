@@ -2,13 +2,11 @@ package com.dmdeemer.stringtune
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
-import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Bundle
-import android.widget.Button
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,29 +17,41 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.pow
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var recordButton: Button
-    private lateinit var playButton: Button
-    private lateinit var statusText: TextView
+    private lateinit var synchrogramView: SynchrogramView
+    private lateinit var noteSlider: SeekBar
+    private lateinit var noteLabel: TextView
 
     private val sampleRate = 44100
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-    private val recordingDurationMs = 5000L
 
-    private var audioData: ShortArray? = null
+    // Ring buffer large enough for the lowest note (A0 ≈ 1604 samples/period)
+    private val maxBufferSamples = 2048
+    private val audioRingBuffer = ShortArray(maxBufferSamples)
+    private var ringWritePos = 0
+
+    // Default to A4 (index 48 out of 0–87)
+    private var selectedKeyIndex = 48
+
     private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private var activeJob: Job? = null
+    private var recordingJob: Job? = null
+
+    // Note names using flat (♭) notation, cycling A through G♭
+    private val noteNames = arrayOf(
+        "A", "B\u266D", "B", "C", "D\u266D", "D", "E\u266D", "E", "F", "G\u266D", "G", "A\u266D"
+    )
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
             if (isGranted) {
-                startRecording()
+                startContinuousRecording()
             } else {
                 Toast.makeText(this, R.string.permission_required, Toast.LENGTH_LONG).show()
             }
@@ -51,12 +61,43 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        recordButton = findViewById(R.id.recordButton)
-        playButton = findViewById(R.id.playButton)
-        statusText = findViewById(R.id.statusText)
+        synchrogramView = findViewById(R.id.synchrogramView)
+        noteSlider = findViewById(R.id.noteSlider)
+        noteLabel = findViewById(R.id.noteLabel)
 
-        recordButton.setOnClickListener { onRecordClicked() }
-        playButton.setOnClickListener { onPlayClicked() }
+        noteSlider.max = 87  // 88 keys: index 0 (A0) through 87 (C8)
+        noteSlider.progress = selectedKeyIndex
+        updateNoteLabel(selectedKeyIndex)
+
+        noteSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                selectedKeyIndex = progress
+                updateNoteLabel(progress)
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar) {}
+        })
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            startContinuousRecording()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        recordingJob?.cancel()
+        recordingJob = null
     }
 
     override fun onDestroy() {
@@ -64,103 +105,65 @@ class MainActivity : AppCompatActivity() {
         activityScope.cancel()
     }
 
-    private fun onRecordClicked() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            startRecording()
-        } else {
-            requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-        }
-    }
-
-    private fun startRecording() {
-        recordButton.isEnabled = false
-        playButton.isEnabled = false
-        statusText.setText(R.string.status_recording)
-
-        val totalSamples = (sampleRate * recordingDurationMs / 1000).toInt()
-        val buffer = ShortArray(totalSamples)
-
-        activeJob?.cancel()
-        activeJob = activityScope.launch {
+    private fun startContinuousRecording() {
+        recordingJob?.cancel()
+        recordingJob = activityScope.launch {
             withContext(Dispatchers.IO) {
                 val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
                 if (minBufferSize <= 0) return@withContext
+
                 val recorder = AudioRecord(
                     MediaRecorder.AudioSource.MIC,
                     sampleRate,
                     channelConfig,
                     audioFormat,
-                    maxOf(minBufferSize, totalSamples * 2)
+                    maxOf(minBufferSize, 4096)
                 )
                 recorder.startRecording()
 
-                var samplesRead = 0
-                while (samplesRead < totalSamples) {
-                    val chunk = recorder.read(buffer, samplesRead, totalSamples - samplesRead)
-                    if (chunk <= 0) break
-                    samplesRead += chunk
+                val readChunk = ShortArray(512)
+                try {
+                    while (isActive) {
+                        val read = recorder.read(readChunk, 0, readChunk.size)
+                        if (read > 0) {
+                            for (i in 0 until read) {
+                                audioRingBuffer[ringWritePos] = readChunk[i]
+                                ringWritePos = (ringWritePos + 1) % maxBufferSamples
+                            }
+                            val wp = ringWritePos
+                            val snapshot = ShortArray(maxBufferSamples) { i ->
+                                audioRingBuffer[(wp + i) % maxBufferSamples]
+                            }
+                            val freq = keyFrequency(selectedKeyIndex)
+                            withContext(Dispatchers.Main) {
+                                synchrogramView.updateAudio(snapshot, freq)
+                            }
+                        }
+                    }
+                } finally {
+                    recorder.stop()
+                    recorder.release()
                 }
-
-                recorder.stop()
-                recorder.release()
             }
-
-            audioData = buffer
-            statusText.setText(R.string.status_recorded)
-            recordButton.isEnabled = true
-            playButton.isEnabled = true
         }
     }
 
-    private fun onPlayClicked() {
-        val data = audioData ?: return
-        playButton.isEnabled = false
-        recordButton.isEnabled = false
-        statusText.setText(R.string.status_playing)
+    /** Returns the frequency in Hz for the given piano key index (0 = A0, 48 = A4 = 440 Hz). */
+    private fun keyFrequency(keyIndex: Int): Double =
+        440.0 * 2.0.pow((keyIndex - 48) / 12.0)
 
-        activeJob?.cancel()
-        activeJob = activityScope.launch {
-            withContext(Dispatchers.IO) {
-                val minBufferSize = AudioTrack.getMinBufferSize(
-                    sampleRate,
-                    AudioFormat.CHANNEL_OUT_MONO,
-                    audioFormat
-                )
-                if (minBufferSize <= 0) return@withContext
+    /**
+     * Returns the note name for the given piano key index using flat (♭) notation.
+     * Key 0 = A0, key 2 = B0, key 3 = C1, ..., key 87 = C8.
+     */
+    private fun noteName(keyIndex: Int): String {
+        val noteIndex = keyIndex % 12
+        // Octave increments at C (noteIndex == 3); A and B stay in the lower octave number
+        val octave = if (noteIndex < 3) keyIndex / 12 else keyIndex / 12 + 1
+        return "${noteNames[noteIndex]}$octave"
+    }
 
-                val audioTrack = AudioTrack.Builder()
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build()
-                    )
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setSampleRate(sampleRate)
-                            .setEncoding(audioFormat)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(maxOf(minBufferSize, data.size * 2))
-                    .setTransferMode(AudioTrack.MODE_STATIC)
-                    .build()
-
-                audioTrack.write(data, 0, data.size)
-                audioTrack.play()
-
-                val durationMs = data.size.toLong() * 1000L / sampleRate
-                delay(durationMs + 200)
-
-                audioTrack.stop()
-                audioTrack.release()
-            }
-
-            statusText.setText(R.string.status_recorded)
-            recordButton.isEnabled = true
-            playButton.isEnabled = true
-        }
+    private fun updateNoteLabel(keyIndex: Int) {
+        noteLabel.text = noteName(keyIndex)
     }
 }
