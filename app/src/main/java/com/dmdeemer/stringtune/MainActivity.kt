@@ -158,7 +158,7 @@ class MainActivity : AppCompatActivity() {
      */
     private fun noteName(keyIndex: Int): String {
         val noteIndex = keyIndex % 12
-        // Octave increments at C (noteIndex == 3); A and B stay in the lower octave number
+        // Piano octave numbers increment at C, so A and B belong to the lower octave number
         val octave = if (noteIndex < 3) keyIndex / 12 else keyIndex / 12 + 1
         return "${noteNames[noteIndex]}$octave"
     }

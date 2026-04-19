@@ -84,6 +84,7 @@ class SynchrogramView @JvmOverloads constructor(
         val kMin = maxOf(1, ceil(50.0 / samplesPerPeriod).toInt())
         val kMax = floor(1000.0 / samplesPerPeriod).toInt()
         val k = if (kMax >= kMin) {
+            // Target ~525 samples (midpoint of the 50–1000 preferred range)
             (525.0 / samplesPerPeriod).roundToInt().coerceIn(kMin, kMax)
         } else {
             kMin
